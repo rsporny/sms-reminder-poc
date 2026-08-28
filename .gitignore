@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+
+# Credentials safety net: ignore every JSON in the repo root by default, so a downloaded
+# Google service-account key (named <project>-<hash>.json) can never be committed by accident.
+# Allow-list the two that belong here.
+/*.json
+!/package.json
+!/package-lock.json

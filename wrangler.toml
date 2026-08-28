@@ -1,0 +1,14 @@
+name = "salon-sms-reminder"
+main = "src/index.js"
+compatibility_date = "2026-08-25"
+
+# Every 15 minutes: send reminders due in 23-25h, escalate unanswered ones to red.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Non-secret config only. Secrets (GOOGLE_SA_EMAIL, GOOGLE_SA_PRIVATE_KEY, SMSAPI_TOKEN,
+# CALLBACK_SECRET) are set with `wrangler secret put` and never live in this repo.
+[vars]
+CALENDAR_ID = "72c13ff75605d810557bf9c6683bca7e2b5cfeddc0e39917b4d24b9d6316ee8d@group.calendar.google.com"
+SALON_NAME = "Salon Radek"
+SALON_PHONE = "500100200"

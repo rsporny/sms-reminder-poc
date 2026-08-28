@@ -1,0 +1,16 @@
+{
+  "name": "salon-sms-reminder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SMS appointment reminders for a hair salon, driven entirely by Google Calendar",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4",
+    "wrangler": "^4.42.0"
+  }
+}
