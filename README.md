@@ -10,19 +10,28 @@ A zero-maintenance SMS appointment reminder system for a hair salon, built on **
    ```
    (client's name, 9-digit phone number, optionally a service description)
 
-2. **~24h before the appointment** the system automatically sends an SMS via the [SMSAPI](https://www.smsapi.pl) gateway (a 2Way message, sent from a reply-capable number):
-   > Salon [NAME]: reminder about your appointment tomorrow (Thu 28.08) at 14:00. Reply TAK to confirm. To cancel call [SALON PHONE]
+2. **Within 15 minutes of saving it** the client gets a booking acknowledgement via the [SMSAPI](https://www.smsapi.pl) gateway (a 2Way message, sent from a reply-capable number). Informational only — it does not ask for anything:
+   > Salon [NAME]: rezerwacja przyjeta na czw 28.08 o 14:00. Przypomnimy dzien wczesniej. Odwolanie: tel [SALON PHONE]
 
-3. The client replies **TAK** ("yes") → SMSAPI calls our webhook → the system marks the appointment as confirmed.
+3. **~24h before the appointment** the reminder goes out, and this one does ask:
+   > Salon [NAME]: przypominamy o wizycie czw 28.08 o 14:00. Odpisz TAK aby potwierdzic. Odwolanie: tel [SALON PHONE]
 
-4. In the morning, the owner glances at the calendar and sees a traffic-light system:
+4. The client replies **TAK** ("yes") → SMSAPI calls our webhook → the system marks the appointment as confirmed.
+
+5. **If the owner moves the appointment**, the client is told the new time. If they had already been asked to confirm the old one, the notice asks again and the appointment drops back to yellow — a green appointment the client agreed to at a different hour is worse than no confirmation at all.
+   > Salon [NAME]: zmiana terminu wizyty na pt 29.08 o 16:00. Odpisz TAK aby potwierdzic. Odwolanie: tel [SALON PHONE]
+
+6. In the morning, the owner glances at the calendar and sees a traffic-light system:
 
    | Event color | Meaning |
    |---|---|
-   | default | future appointment, SMS not sent yet |
-   | 🟡 yellow (`colorId: 5`) | SMS sent, waiting for confirmation |
+   | default | future appointment, no reminder sent yet (a booking SMS leaves the color alone) |
+   | 🟡 yellow (`colorId: 5`) | confirmation asked, waiting for the reply |
    | 🟢 green (`colorId: 10`) + `✅` in title | client confirmed |
-   | 🔴 red (`colorId: 11`) | no reply after 4h → **call this client** |
+   | 🔴 red (`colorId: 11`) | no reply 4h after the last ask → **call this client** |
+
+   Moving a green or yellow appointment resets it to yellow (clearing the `✅`) and restarts the 4h
+   clock, because the client is being asked about a different time.
 
 The owner never operates any application other than their calendar.
 
@@ -37,12 +46,14 @@ The owner never operates any application other than their calendar.
 │ Cloudflare Worker (single file, Free plan)   │
 │                                              │
 │  scheduled()  – Cron Trigger every 15 min    │
+│   • created < 1h ago → booking SMS           │
+│   • start ≠ notifiedStart → reschedule SMS   │
 │   • events in the 23–25h window → send SMS   │
 │   • mark yellow + set reminderSent flag      │
 │   • yellow > 4h with no reply → red          │
 │                                              │
 │  fetch() – POST /sms-callback (from SMSAPI)  │
-│   • body ≈ "TAK" → match appointment by phone│
+│   • body ≈ "TAK" → match on MsgId            │
 │   • ✅ + green + confirmed flag              │
 │   • respond with body "OK" (SMSAPI requires) │
 └───────┬──────────────────────────────────────┘
@@ -92,7 +103,7 @@ In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy wo
 |---|---|
 | Cloudflare Workers | 0 PLN (Free plan) |
 | Google Calendar API | 0 PLN |
-| SMS (SMSAPI, 2Way) | ~0.08–0.12 PLN net / SMS → at ~200 appointments/month **20–30 PLN/month** |
+| SMS (SMSAPI, 2Way) | ~0.08–0.12 PLN net / SMS. Budget ~2 per appointment (booking + reminder), plus one per reschedule → at ~200 appointments/month **40–60 PLN/month** |
 | Receiving "TAK" replies | 0 PLN |
 
 ## Repo structure
@@ -101,10 +112,14 @@ In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy wo
 .
 ├── src/
 │   └── index.js          # the entire Worker: scheduled() + fetch()
+├── test/
+│   └── index.test.js     # vitest over the pure functions
 ├── wrangler.toml
+├── package.json
 ├── .github/workflows/
 │   └── deploy.yml
 ├── README.md
+├── TESTING.md            # live end-to-end runbook
 └── CLAUDE.md             # instructions for Claude Code
 ```
 
@@ -144,9 +159,11 @@ wrangler tail --format pretty
 Expected lines per cron tick — one summary, then one per event:
 
 ```
-tick: 12 events in window, 2 due, 1 stale
-event abc123: reminder sent to 48500***456
-event def456: no reply after 4h — marked red
+tick: 12 events in window, 2 due, 1 stale, 1 new, 1 moved
+event abc123: booking sms sent to 48500***456
+event def456: reschedule sms sent to 48500***789 (askConfirm=true)
+event ghi789: reminder sent to 48500***456
+event jkl012: no reply after 4h — marked red
 ```
 
 Numbers are always masked in logs; a full client number should never appear.
@@ -171,8 +188,13 @@ Against a local `wrangler dev`:
 
 ```bash
 curl -X POST 'http://localhost:8787/sms-callback?secret=test' \
-  -d 'sms_from=48500123456' -d 'sms_text=TAK'
+  -d 'sms_from=48500123456' -d 'sms_text=TAK' -d 'MsgId=1460969715572091219'
 ```
+
+`MsgId` is what identifies the appointment — it is the id of the 2way message being replied to, and
+the Worker stores the id of the last message that *asked* for confirmation. Omit it and the reply is
+acknowledged but matches nothing, which is also what happens when a client replies to the
+informational booking SMS.
 
 Expected responses:
 
@@ -181,7 +203,8 @@ Expected responses:
 | correct `secret` | 200 | `OK` |
 | wrong or missing `secret` | 403 | `forbidden` |
 | reply that isn't a confirmation | 200 | `OK` (logged as non-confirmation) |
-| no matching appointment | 200 | `OK` (logged as no match) |
+| `TAK` with no usable `MsgId` | 200 | `OK` (logged with the field names received) |
+| `MsgId` matching no pending ask | 200 | `OK` (logged as superseded or informational) |
 
 The body is `OK` on every 200 path including internal errors — that is deliberate, see below.
 
@@ -207,4 +230,23 @@ ignores longer digit runs so an invoice number in the title isn't mistaken for a
 
 **An appointment never turns yellow.** The send window is 23–25h before the start, so an
 appointment created less than 23h ahead never gets a reminder. This is by design — a reminder
-sent 3h before the slot has little value and risks annoying the client.
+sent 3h before the slot has little value and risks annoying the client. Such an appointment still
+gets its booking acknowledgement, which carries the date and time.
+
+**Confirmations stopped working entirely — every reply logs "without a usable MsgId".** Replies are
+matched only on `MsgId`, the id of the 2way message being answered
+([docs](https://www.smsapi.pl/docs/#10-odbiory-wiadomosci)). It is documented as empty for replies
+to a *dedicated* number, so this is what a switch away from the shared 2Way pool looks like. The log
+line lists the fields SMSAPI actually posted — check it before assuming anything else.
+
+**A newly created appointment got no booking SMS.** Three by-design reasons, in order of likelihood:
+it is an instance of a recurring series (one creation, many instances — they are skipped, and the
+24h reminder still covers them); it already existed before this feature was deployed (the pass only
+looks at events created in the last hour, which is what stops a whole calendar being blasted
+retroactively); or the Worker was down for more than an hour after the booking. Reminders are never
+affected by any of the three.
+
+**An appointment was moved but the client wasn't told.** The reschedule pass sees events touched in
+the last hour, so a move made during a longer outage is missed permanently. The client still has the
+correct time if the appointment has not yet been reminded, and the reminder itself always quotes the
+current start.
