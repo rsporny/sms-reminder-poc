@@ -1,8 +1,9 @@
 /**
  * Salon SMS Reminder — the entire Worker.
  *
- * scheduled(): every 15 min, sends a reminder SMS ~24h before each appointment and
- * escalates unanswered ones to red. fetch(): receives the client's "TAK" reply from SMSAPI.
+ * scheduled(): every 15 min, acknowledges newly booked appointments, notifies clients whose
+ * appointment moved, sends a reminder SMS ~24h before each appointment, and escalates unanswered
+ * ones to red. fetch(): receives the client's "TAK" reply from SMSAPI.
  *
  * State lives on the Google Calendar event (extendedProperties.private + colorId) — no database.
  * See CLAUDE.md for the hard requirements this file implements.
@@ -21,6 +22,8 @@
  * @property {string} [summary]
  * @property {string} [description]
  * @property {string} [colorId]
+ * @property {string} [created]           set once on insert; never changes, unlike `updated`
+ * @property {string} [recurringEventId]  present on instances of a recurring series
  * @property {{ dateTime?: string, date?: string }} [start]
  * @property {{ private?: Record<string,string> }} [extendedProperties]
  */
@@ -29,8 +32,11 @@ const HOUR = 3600_000;
 const TZ = "Europe/Warsaw";
 const CHECK = "✅";
 
+/** How far back the booking pass trusts `created` — 4 cron ticks of slack. */
+const BOOKING_LOOKBACK = HOUR;
+
 /** Traffic light the salon owner reads off the calendar. */
-const YELLOW = "5"; // SMS sent, awaiting reply
+const YELLOW = "5"; // confirmation asked, awaiting reply
 const GREEN = "10"; // client confirmed
 const RED = "11"; // no reply after 4h — call this client
 
@@ -137,7 +143,7 @@ export function formatWhen(isoStart) {
 }
 
 /**
- * The reminder SMS. Polish (the clients are Polish) but diacritic-free, and ≤160 GSM-7 chars.
+ * The 24h reminder. Polish (the clients are Polish) but diacritic-free, and ≤160 GSM-7 chars.
  *
  * @param {{ salonName: string, salonPhone: string, start: string }} args
  * @returns {string}
@@ -148,6 +154,52 @@ export function buildMessage({ salonName, salonPhone, start }) {
     `${salonName}: przypominamy o wizycie ${date} o ${time}. ` +
       `Odpisz TAK aby potwierdzic. Odwolanie: tel ${salonPhone}`,
   );
+}
+
+/**
+ * Acknowledgement sent when the appointment is first booked. Informational only — it never asks
+ * for TAK, so a reply to it confirms nothing (see handleCallback).
+ *
+ * @param {{ salonName: string, salonPhone: string, start: string }} args
+ * @returns {string}
+ */
+export function buildBookingMessage({ salonName, salonPhone, start }) {
+  const { date, time } = formatWhen(start);
+  return gsmSanitize(
+    `${salonName}: rezerwacja przyjeta na ${date} o ${time}. ` +
+      `Przypomnimy dzien wczesniej. Odwolanie: tel ${salonPhone}`,
+  );
+}
+
+/**
+ * Sent when the owner moves an appointment. Asks for TAK again only if the client had already
+ * been asked to confirm the old time — a client who has only ever had the booking SMS just gets
+ * the new time.
+ *
+ * @param {{ salonName: string, salonPhone: string, start: string, askConfirm?: boolean }} args
+ * @returns {string}
+ */
+export function buildRescheduleMessage({ salonName, salonPhone, start, askConfirm = false }) {
+  const { date, time } = formatWhen(start);
+  return gsmSanitize(
+    `${salonName}: zmiana terminu wizyty na ${date} o ${time}. ` +
+      (askConfirm ? "Odpisz TAK aby potwierdzic. " : "") +
+      `Odwolanie: tel ${salonPhone}`,
+  );
+}
+
+/**
+ * The SMSAPI message id of a successful send (`{count, list:[{id, ...}]}`). It is what the
+ * incoming-SMS callback echoes back as `MsgId`, and therefore the only link between a reply and
+ * the appointment it answers.
+ *
+ * @param {any} response parsed sms.do body
+ * @returns {string|null}
+ */
+export function extractMsgId(response) {
+  const id = response?.list?.[0]?.id;
+  if (typeof id === "number") return String(id);
+  return typeof id === "string" && id ? id : null;
 }
 
 /** @param {Date|number} now */
@@ -174,8 +226,73 @@ export function selectDueEvents(events, now) {
 }
 
 /**
- * Appointments to escalate to red: reminded over 4h ago, still unconfirmed, still in the future,
+ * Appointments just booked, owed an acknowledgement SMS.
+ *
+ * Two gates, both needed. `created` is immutable, so it identifies genuinely new events — our own
+ * patches bump `updated` but never `created`, and on first deploy the whole existing calendar is
+ * older than the lookback, so nobody gets a retroactive blast. `bookingSmsSentAt` is then the hard
+ * idempotency guarantee, same contract as `reminderSentAt`.
+ *
+ * @param {CalendarEvent[]} events
+ * @param {Date|number} now
+ * @returns {CalendarEvent[]}
+ */
+export function selectNewEvents(events, now) {
+  const nowMs = toMs(now);
+  return events.filter((ev) => {
+    if (!ev?.start?.dateTime) return false; // all-day
+    if (ev.recurringEventId) return false; // one creation, many instances — reminders still cover them
+    const priv = ev.extendedProperties?.private;
+    if (priv?.bookingSmsSentAt) return false;
+    if (priv?.reminderSentAt) return false; // already further along than a booking SMS
+    const startMs = Date.parse(ev.start.dateTime);
+    if (Number.isNaN(startMs) || startMs <= nowMs) return false;
+    const createdMs = Date.parse(ev.created ?? "");
+    if (Number.isNaN(createdMs)) return false; // no stamp → not provably new
+    return nowMs - createdMs <= BOOKING_LOOKBACK;
+  });
+}
+
+/**
+ * Appointments whose start no longer matches what the client was last told.
+ *
+ * @param {CalendarEvent[]} events
+ * @param {Date|number} now
+ * @returns {CalendarEvent[]}
+ */
+export function selectRescheduledEvents(events, now) {
+  const nowMs = toMs(now);
+  return events.filter((ev) => {
+    if (!ev?.start?.dateTime) return false;
+    const notified = ev.extendedProperties?.private?.notifiedStart;
+    if (!notified) return false; // we have never told this client anything
+    const startMs = Date.parse(ev.start.dateTime);
+    const notifiedMs = Date.parse(notified);
+    if (Number.isNaN(startMs) || Number.isNaN(notifiedMs)) return false;
+    if (startMs <= nowMs) return false;
+    // Compare instants, not strings: Google may re-serialize +02:00 as Z for the same moment.
+    return startMs !== notifiedMs;
+  });
+}
+
+/**
+ * Has this client already been asked to confirm this appointment? If so a reschedule has to ask
+ * again (and drop back to yellow); if not, the reschedule is purely informational.
+ *
+ * @param {CalendarEvent} ev
+ * @returns {boolean}
+ */
+export function needsReconfirmation(ev) {
+  const priv = ev?.extendedProperties?.private;
+  return Boolean(priv?.confirmedAt || priv?.reminderSentAt);
+}
+
+/**
+ * Appointments to escalate to red: asked over 4h ago, still unconfirmed, still in the future,
  * and not already red (so the cron stops re-patching them every tick).
+ *
+ * The clock runs from the *last* ask, so a reschedule restarts it. Events written before
+ * confirmAskedAt existed fall back to reminderSentAt.
  *
  * @param {CalendarEvent[]} events
  * @param {Date|number} now
@@ -185,35 +302,16 @@ export function selectStaleEvents(events, now) {
   const nowMs = toMs(now);
   return events.filter((ev) => {
     const props = ev?.extendedProperties?.private;
-    if (!props?.reminderSentAt || props.confirmedAt) return false;
+    if (!props || props.confirmedAt) return false;
+    const askedAt = props.confirmAskedAt ?? props.reminderSentAt;
+    if (!askedAt) return false;
     if (ev.colorId === RED) return false;
     const startMs = Date.parse(ev?.start?.dateTime ?? "");
     if (Number.isNaN(startMs) || startMs <= nowMs) return false;
-    const sentMs = Date.parse(props.reminderSentAt);
-    if (Number.isNaN(sentMs)) return false;
-    return nowMs - sentMs >= 4 * HOUR;
+    const askedMs = Date.parse(askedAt);
+    if (Number.isNaN(askedMs)) return false;
+    return nowMs - askedMs >= 4 * HOUR;
   });
-}
-
-/**
- * Which appointment does an incoming "TAK" belong to? The soonest future unconfirmed one.
- *
- * @param {CalendarEvent[]} events
- * @param {Date|number} now
- * @returns {CalendarEvent|null}
- */
-export function pickNearestUnconfirmed(events, now) {
-  const nowMs = toMs(now);
-  let best = null;
-  let bestMs = Infinity;
-  for (const ev of events) {
-    if (ev?.extendedProperties?.private?.confirmedAt) continue;
-    const startMs = Date.parse(ev?.start?.dateTime ?? ev?.start?.date ?? "");
-    if (Number.isNaN(startMs) || startMs <= nowMs || startMs >= bestMs) continue;
-    best = ev;
-    bestMs = startMs;
-  }
-  return best;
 }
 
 /**
@@ -224,6 +322,15 @@ export function pickNearestUnconfirmed(events, now) {
 export function withCheck(summary) {
   const text = (summary ?? "").trim();
   return text.startsWith(CHECK) ? text : `${CHECK} ${text}`.trim();
+}
+
+/**
+ * Drop the checkmark again — a rescheduled appointment is no longer confirmed.
+ * @param {string|null|undefined} summary
+ * @returns {string}
+ */
+export function withoutCheck(summary) {
+  return (summary ?? "").replace(new RegExp(`^\\s*${CHECK}\\s*`), "").trim();
 }
 
 /* ------------------------------------------------------------------ *
@@ -352,7 +459,7 @@ async function patchEvent(env, token, eventId, body) {
 
 /**
  * Send one SMS. Throws on a gateway error so the caller skips the calendar write and the
- * next cron tick retries — a reminder is never marked sent unless it actually went out.
+ * next cron tick retries — a message is never marked sent unless it actually went out.
  *
  * @param {Env} env
  * @param {string} to normalized `48XXXXXXXXX`
@@ -392,6 +499,118 @@ async function sendSms(env, to, message) {
  * ------------------------------------------------------------------ */
 
 /**
+ * Flags recorded whenever we ask a client to confirm: the time we quoted, when we asked, and the
+ * SMSAPI id of the ask. The webhook matches replies on that id and nothing else, so overwriting it
+ * on every new ask is what makes a TAK answering a superseded message a no-op.
+ *
+ * A null id deletes the key rather than leaving a stale one in place.
+ *
+ * @param {any} sendResult parsed sms.do body
+ * @param {string} start the start.dateTime quoted in the message
+ * @param {Date} now
+ * @param {string} eventId for logging
+ */
+function askProps(sendResult, start, now, eventId) {
+  const msgId = extractMsgId(sendResult);
+  if (!msgId) {
+    console.log(`event ${eventId}: smsapi returned no message id — this ask cannot be confirmed`);
+  }
+  return {
+    notifiedStart: start,
+    confirmAskedAt: now.toISOString(),
+    confirmAskMsgId: msgId,
+  };
+}
+
+/**
+ * Acknowledge a freshly booked appointment. No colour change (the traffic light is reminder state)
+ * and deliberately no confirmAskMsgId — a reply to this message must not confirm anything.
+ *
+ * @param {Env} env
+ * @param {string} token
+ * @param {CalendarEvent} ev
+ * @param {Date} now
+ */
+async function sendBookingSms(env, token, ev, now) {
+  const phone = parsePhone(`${ev.summary ?? ""} ${ev.description ?? ""}`);
+  if (!phone) {
+    console.log(`event ${ev.id}: no phone number in title/description — skipped`);
+    return;
+  }
+
+  const start = /** @type {string} */ (ev.start?.dateTime);
+  await sendSms(
+    env,
+    phone,
+    buildBookingMessage({ salonName: env.SALON_NAME, salonPhone: env.SALON_PHONE, start }),
+  );
+
+  await patchEvent(env, token, ev.id, {
+    extendedProperties: {
+      private: {
+        ...(ev.extendedProperties?.private ?? {}),
+        bookingSmsSentAt: now.toISOString(),
+        clientPhone: phone,
+        notifiedStart: start,
+      },
+    },
+  });
+  console.log(`event ${ev.id}: booking sms sent to ${maskPhone(phone)}`);
+}
+
+/**
+ * Tell the client their appointment moved. If they had already been asked to confirm the old time,
+ * ask again and drop back to yellow — a green appointment the client agreed to at a different hour
+ * is worse than no confirmation at all.
+ *
+ * @param {Env} env
+ * @param {string} token
+ * @param {CalendarEvent} ev
+ * @param {Date} now
+ */
+async function sendRescheduleSms(env, token, ev, now) {
+  const priv = ev.extendedProperties?.private ?? {};
+  const phone = priv.clientPhone ?? parsePhone(`${ev.summary ?? ""} ${ev.description ?? ""}`);
+  if (!phone) {
+    console.log(`event ${ev.id}: no phone number in title/description — skipped`);
+    return;
+  }
+
+  const start = /** @type {string} */ (ev.start?.dateTime);
+  const askConfirm = needsReconfirmation(ev);
+  const sent = await sendSms(
+    env,
+    phone,
+    buildRescheduleMessage({
+      salonName: env.SALON_NAME,
+      salonPhone: env.SALON_PHONE,
+      start,
+      askConfirm,
+    }),
+  );
+
+  await patchEvent(
+    env,
+    token,
+    ev.id,
+    askConfirm
+      ? {
+          colorId: YELLOW,
+          // Only rewrite a title that exists — an event carrying its phone in the description
+          // alone would otherwise be blanked.
+          ...(ev.summary ? { summary: withoutCheck(ev.summary) } : {}),
+          extendedProperties: {
+            private: { ...priv, confirmedAt: null, ...askProps(sent, start, now, ev.id) },
+          },
+        }
+      : { extendedProperties: { private: { ...priv, notifiedStart: start } } },
+  );
+  console.log(
+    `event ${ev.id}: reschedule sms sent to ${maskPhone(phone)} (askConfirm=${askConfirm})`,
+  );
+}
+
+/**
  * Send one reminder and record it on the event.
  *
  * Order is deliberate: SMS first, calendar write second. A failed send leaves reminderSentAt
@@ -409,14 +628,11 @@ async function sendReminder(env, token, ev, now) {
     return;
   }
 
-  await sendSms(
+  const start = /** @type {string} */ (ev.start?.dateTime);
+  const sent = await sendSms(
     env,
     phone,
-    buildMessage({
-      salonName: env.SALON_NAME,
-      salonPhone: env.SALON_PHONE,
-      start: /** @type {string} */ (ev.start?.dateTime),
-    }),
+    buildMessage({ salonName: env.SALON_NAME, salonPhone: env.SALON_PHONE, start }),
   );
 
   await patchEvent(env, token, ev.id, {
@@ -426,6 +642,7 @@ async function sendReminder(env, token, ev, now) {
         ...(ev.extendedProperties?.private ?? {}),
         reminderSentAt: now.toISOString(),
         clientPhone: phone,
+        ...askProps(sent, start, now, ev.id),
       },
     },
   });
@@ -433,8 +650,12 @@ async function sendReminder(env, token, ev, now) {
 }
 
 /**
- * Cron entry point. One calendar read serves both passes — the 26h window covers the 23–25h
- * send band and every escalation candidate (reminded at ~24h, red from ~20h out until it starts).
+ * Cron entry point.
+ *
+ * Two reads. The 26h window covers the 23–25h send band and every escalation candidate (asked at
+ * ~24h, red from ~20h out until it starts). The second read is everything in the future touched in
+ * the last hour, which is where creations and moves show up — `created` and `notifiedStart` then
+ * tell the two apart.
  *
  * @param {ScheduledEvent} _event
  * @param {Env} env
@@ -442,17 +663,53 @@ async function sendReminder(env, token, ev, now) {
 async function scheduled(_event, env) {
   const now = new Date();
   const token = await getAccessToken(env);
-  const events = await listEvents(env, token, {
-    timeMin: now.toISOString(),
-    timeMax: new Date(now.getTime() + 26 * HOUR).toISOString(),
-  });
+  const [upcoming, touched] = await Promise.all([
+    listEvents(env, token, {
+      timeMin: now.toISOString(),
+      timeMax: new Date(now.getTime() + 26 * HOUR).toISOString(),
+    }),
+    listEvents(env, token, {
+      timeMin: now.toISOString(),
+      updatedMin: new Date(now.getTime() - BOOKING_LOOKBACK).toISOString(),
+    }),
+  ]);
 
-  const due = selectDueEvents(events, now);
-  const stale = selectStaleEvents(events, now);
-  console.log(`tick: ${events.length} events in window, ${due.length} due, ${stale.length} stale`);
+  const fresh = selectNewEvents(touched, now);
+  const moved = selectRescheduledEvents(touched, now);
+  const due = selectDueEvents(upcoming, now);
+  const stale = selectStaleEvents(upcoming, now);
+  console.log(
+    `tick: ${upcoming.length} events in window, ${due.length} due, ${stale.length} stale, ` +
+      `${fresh.length} new, ${moved.length} moved`,
+  );
+
+  // Booking and reschedule run first, and anything messaged here sits out the reminder loop: an
+  // appointment booked ~24h ahead lands in both passes on the same tick, and two SMS seconds apart
+  // is spam. The 23–25h window is 2h wide, so the reminder simply goes out on the next tick.
+  const messaged = new Set();
 
   // Per-event try/catch: one bad event must not abort the rest of the run.
+  for (const ev of fresh) {
+    try {
+      await sendBookingSms(env, token, ev, now);
+      messaged.add(ev.id);
+    } catch (err) {
+      console.log(`event ${ev.id}: booking sms failed — ${err.message}`);
+    }
+  }
+  for (const ev of moved) {
+    try {
+      await sendRescheduleSms(env, token, ev, now);
+      messaged.add(ev.id);
+    } catch (err) {
+      console.log(`event ${ev.id}: reschedule sms failed — ${err.message}`);
+    }
+  }
   for (const ev of due) {
+    if (messaged.has(ev.id)) {
+      console.log(`event ${ev.id}: already messaged this tick — reminder deferred to the next one`);
+      continue;
+    }
     try {
       await sendReminder(env, token, ev, now);
     } catch (err) {
@@ -472,8 +729,16 @@ async function scheduled(_event, env) {
 const okResponse = () =>
   new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
 
+/** SMSAPI documents MsgId as "nie większej niż 32 znaki". */
+const MSG_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
 /**
- * SMSAPI incoming-SMS webhook. Fields are `sms_from` / `sms_text`, form-encoded.
+ * SMSAPI incoming-SMS webhook. Fields are `sms_from` / `sms_text` / `MsgId`, form-encoded.
+ *
+ * `MsgId` is the id of the 2way message being replied to, which is the only reliable link between
+ * a "TAK" and the appointment it answers — a client may be holding a booking SMS, an old reminder
+ * and a reschedule notice at once. We store the id of the last message that *asked* for
+ * confirmation, so a reply to anything else matches nothing and is ignored.
  *
  * Every outcome answers 200 with the body `OK` — SMSAPI redelivers indefinitely without it,
  * so even an internal failure is logged and acknowledged rather than surfaced as a 500.
@@ -489,34 +754,39 @@ async function handleCallback(request, env) {
 
   try {
     const form = new URLSearchParams(await request.text());
-    const phone = parsePhone(form.get("sms_from"));
+    const phone = parsePhone(form.get("sms_from")); // logging only — MsgId does the matching
     const body = form.get("sms_text") ?? "";
-    if (!phone) {
-      console.log(`callback: unrecognized sender ${JSON.stringify(form.get("sms_from"))}`);
-      return okResponse();
-    }
     if (!isConfirmation(body)) {
       // Not a "yes" — possibly a cancellation, so leave a trace for the owner.
       console.log(`callback: non-confirmation from ${maskPhone(phone)}: ${JSON.stringify(body)}`);
       return okResponse();
     }
 
+    const msgId = form.get("MsgId") ?? "";
+    if (!MSG_ID_RE.test(msgId)) {
+      // Nothing to match on. Log which fields did arrive — that is the diagnostic if SMSAPI ever
+      // stops sending MsgId (documented as empty for replies to a dedicated number).
+      console.log(
+        `callback: confirmation from ${maskPhone(phone)} without a usable MsgId — ` +
+          `fields received: ${[...form.keys()].join(", ")}`,
+      );
+      return okResponse();
+    }
+
     const now = new Date();
     const token = await getAccessToken(env);
-    const events = await listEvents(env, token, {
+    const [match] = await listEvents(env, token, {
       timeMin: now.toISOString(),
-      privateExtendedProperty: `clientPhone=${phone}`,
+      privateExtendedProperty: `confirmAskMsgId=${msgId}`,
     });
-
-    const match = pickNearestUnconfirmed(events, now);
     if (!match) {
-      console.log(`callback: no pending appointment for ${maskPhone(phone)}`);
+      console.log(`callback: MsgId ${msgId} answers no pending ask — superseded or informational`);
       return okResponse();
     }
 
     await patchEvent(env, token, match.id, {
       colorId: GREEN,
-      summary: withCheck(match.summary),
+      ...(match.summary ? { summary: withCheck(match.summary) } : {}),
       extendedProperties: {
         private: {
           ...(match.extendedProperties?.private ?? {}),

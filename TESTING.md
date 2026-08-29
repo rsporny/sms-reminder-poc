@@ -80,8 +80,8 @@ An appointment must START inside this window to get a reminder:
   28.08.2026, 16:30  ..  28.08.2026, 18:30   (Warsaw local)
 ```
 
-Put A, B and C inside that printed range, spaced ~15 min apart, with **B latest** so A is the
-"nearest" appointment when you reply. Note the window slides forward in real time: an
+Put A, B and C inside that printed range, spaced ~15 min apart, with **B latest** so the two
+reminders are easy to tell apart on the handset. Note the window slides forward in real time: an
 appointment set at the very start of the range falls out of it within minutes, so aim for the
 middle. If you get distracted between creating events and triggering the cron, re-run
 `node diag.mjs` and check the events still show `✅ IN WINDOW`.
@@ -105,7 +105,8 @@ middle. If you get distracted between creating events and triggering the cron, r
 
 Replace `500 123 456` and `+48500123456` with your real number — the two different formats are
 deliberate, they exercise both branches of the phone parser. Both point at the same phone, which
-also tests "nearest appointment wins" when you reply.
+also proves that matching is per-message: two pending asks on one number, and each reply must land
+on the appointment whose SMS you actually answered.
 
 ---
 
@@ -176,12 +177,18 @@ Verify the secret is enforced, and that the query string survived SMSAPI's URL v
 ```fish
 # correct secret → 200 OK
 curl -i -X POST "https://salon-sms-reminder.<sub>.workers.dev/sms-callback?secret=$callback_secret" \
-  -d 'sms_from=48500123456' -d 'sms_text=TAK'
+  -d 'sms_from=48500123456' -d 'sms_text=TAK' -d 'MsgId=1460969715572091219'
 
 # wrong secret → 403 forbidden
 curl -i -X POST "https://salon-sms-reminder.<sub>.workers.dev/sms-callback?secret=wrong" \
-  -d 'sms_from=48500123456' -d 'sms_text=TAK'
+  -d 'sms_from=48500123456' -d 'sms_text=TAK' -d 'MsgId=1460969715572091219'
 ```
+
+**Then prove `MsgId` actually arrives**, because every confirmation depends on it and nothing else.
+With `wrangler tail` running, send yourself any 2way SMS and reply from the handset. The tail must
+show a populated `MsgId`; it is documented as empty only for replies to a *dedicated* number, and
+this Worker sends from the shared 2Way pool. If it comes through empty, stop — confirmations cannot
+work and the no-fallback decision needs revisiting.
 
 > If SMSAPI's panel refuses a URL containing `?secret=...`, that is the one design assumption
 > here that its UI can break. Fallback: move the secret into the path
@@ -249,16 +256,23 @@ Watch the deployed Worker's logs:
 npx wrangler tail --format pretty
 ```
 
-Reply **TAK** to the SMS from your phone. Within a few seconds:
+Reply **TAK to A's SMS** from your phone — reply to that specific message, not a fresh one to the
+number. Within a few seconds:
 
 ```
 event <id>: confirmed by 48501***234
 ```
 
-**Check the calendar:** appointment A (the nearer of the two) is now 🟢 green with `✅` prefixed
-to the title. B is still yellow — one reply confirms one appointment.
+**Check the calendar:** appointment A is now 🟢 green with `✅` prefixed to the title. B is still
+yellow — one reply confirms one appointment.
 
-Reply **TAK** again → B goes green too. This is `pickNearestUnconfirmed` working.
+Now reply **TAK to B's SMS** → B goes green too. Matching runs off `MsgId`, the id of the message
+being answered, so it is the message you pick that decides which appointment is confirmed, never
+the order they appear in the calendar.
+
+If your handset sends replies as new messages rather than threaded ones, SMSAPI may post an empty
+`MsgId`; the tail then logs `without a usable MsgId — fields received: ...` and nothing is
+confirmed. That is the expected behaviour, not a bug — use the reply action on the message itself.
 
 Other replies worth trying:
 
@@ -280,7 +294,7 @@ Escalation fires 4h after the reminder with no reply, which is too long to sit t
 it temporarily in `src/index.js` (`selectStaleEvents`):
 
 ```js
-return nowMs - sentMs >= 4 * HOUR;   // ← change 4 * HOUR to 60_000 for the test
+return nowMs - askedMs >= 4 * HOUR;   // ← change 4 * HOUR to 60_000 for the test
 ```
 
 Then, with one appointment still yellow and unconfirmed, re-run the local cron trigger after a
@@ -296,6 +310,45 @@ Trigger it once more — it should *not* log again, because the code skips event
 **Revert the constant** and re-run `npm test` before deploying anything further.
 
 ---
+
+## Step 9 — booking and reschedule messages
+
+Exercises the other two message types. Everything is already set up; keep `wrangler tail` running
+and re-use the local cron trigger from Step 6.
+
+**Booking.** Create a new one-off appointment with a real phone in the title, dated a few days out
+so the reminder window cannot interfere, then trigger the cron.
+
+```fish
+curl 'http://localhost:8787/__scheduled?cron=*/15+*+*+*+*'
+```
+
+Expected: `event <id>: booking sms sent to 48500***456`, one SMS reading *"rezerwacja przyjeta
+na …"*, `bookingSmsSentAt` / `notifiedStart` / `clientPhone` on the event, and **no color change**.
+Trigger again — the tick must report `0 new` and send nothing.
+
+Reply **TAK** to that booking SMS. Expected: `MsgId … answers no pending ask` and the appointment
+stays grey. The booking message is informational; only a reminder or a reschedule can be confirmed.
+
+**Reschedule, informational.** Drag the appointment to another hour, trigger the cron. Expected:
+one `reschedule sms sent to … (askConfirm=false)`, an SMS reading *"zmiana terminu wizyty na …"*
+with no TAK ask, `notifiedStart` updated, color still unchanged.
+
+**Reschedule, with a re-ask.** Move the appointment into the 23–25h window and trigger — it turns
+🟡 yellow with `confirmAskedAt` and `confirmAskMsgId` set. Now move it again and trigger: expected
+`askConfirm=true`, an SMS that *does* ask for TAK, still yellow, both flags refreshed.
+
+Now reply TAK **to the older reminder** (pick that message on the handset, not the newest one).
+Expected: `MsgId … answers no pending ask` — the appointment stays yellow, because that id was
+superseded. Reply TAK to the newest message instead → 🟢 green with `✅`.
+
+**Reschedule of a confirmed appointment.** With it green, move it once more and trigger. Expected:
+`askConfirm=true`, the appointment back to 🟡 yellow, the `✅` gone from the title and `confirmedAt`
+cleared. Reply TAK to the new message → green and `✅` again.
+
+**Recurring series.** Create a weekly repeating appointment and trigger. Expected: no booking SMS
+at all — instances are skipped so one creation cannot fan out into a burst of messages. The 24h
+reminder still covers each instance.
 
 ---
 
