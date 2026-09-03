@@ -74,7 +74,7 @@ The owner never operates any application other than their calendar.
 - **Runtime:** Cloudflare Workers (Free plan), 1 Cron Trigger `*/15 * * * *`
 - **Calendar:** Google Calendar API v3 via plain `fetch()` — no `googleapis` SDK (doesn't run on Workers); auth: service account + RS256 JWT signed with `crypto.subtle`
 - **SMS:** SMSAPI.pl — 2Way sending (shared inbound number), replies received via callback URL
-- **Deploy:** GitHub Actions → `cloudflare/wrangler-action` → `wrangler deploy` on push to `main`
+- **Deploy:** manual — `npx wrangler deploy` (no CI/CD; this is a PoC)
 - **Language:** JavaScript/TypeScript, zero runtime dependencies
 
 ## One-time setup
@@ -90,7 +90,7 @@ The owner never operates any application other than their calendar.
 2. Activate **2Way** sending (an inbound number from the shared pool).
 3. Panel → **Callback addresses** → "Incoming SMS" → enter the Worker URL: `https://<worker>.workers.dev/sms-callback`.
 
-### 3. Cloudflare + GitHub
+### 3. Cloudflare
 ```bash
 wrangler secret put GOOGLE_SA_EMAIL        # service account e-mail
 wrangler secret put GOOGLE_SA_PRIVATE_KEY  # private_key from the JSON (with \n)
@@ -100,7 +100,7 @@ wrangler secret put CALENDAR_ID            # Calendar ID from step 1.4
 ```
 Non-secret config goes in `wrangler.toml` (`[vars]`): `SALON_NAME`, `SALON_PHONE`.
 
-In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy workflow).
+Deploy with `npx wrangler deploy` — there is no CI/CD, so run it by hand whenever `src/index.js` or `wrangler.toml` changes.
 
 ## Costs
 
@@ -121,8 +121,6 @@ In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy wo
 │   └── index.test.js     # vitest over the pure functions
 ├── wrangler.toml
 ├── package.json
-├── .github/workflows/
-│   └── deploy.yml
 ├── README.md
 ├── TESTING.md            # live end-to-end runbook
 └── CLAUDE.md             # instructions for Claude Code

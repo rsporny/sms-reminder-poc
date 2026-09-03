@@ -60,9 +60,8 @@ Three message types, all transactional: **reminder** (asks for TAK), **booking a
 
 1. `src/index.js` (or `.ts`) — the complete Worker
 2. `wrangler.toml` — cron `*/15 * * * *`, `[vars]`, current `compatibility_date`
-3. `.github/workflows/deploy.yml` — deploy on push to `main` via `cloudflare/wrangler-action`, using the `CLOUDFLARE_API_TOKEN` repo secret
-4. Tests + `npm test` in CI before deploy
-5. A short "Troubleshooting" section appended to the README (how to watch logs with `wrangler tail`, how to test the callback with curl)
+3. Tests (vitest) — run manually with `npm test`; deploy manually with `npx wrangler deploy` (no CI/CD — this is a PoC)
+4. A short "Troubleshooting" section appended to the README (how to watch logs with `wrangler tail`, how to test the callback with curl)
 
 ## What NOT to do
 
