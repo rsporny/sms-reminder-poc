@@ -2,6 +2,10 @@
 
 A zero-maintenance SMS appointment reminder system for a hair salon, built on **Google Calendar** (the only tool the salon owner touches) and **Cloudflare Workers** (all the logic, $0 infrastructure).
 
+> **Status:** proof of concept, not a hardened production service.
+>
+> **Personal data:** the Worker reads client names and phone numbers from Google Calendar event titles and sends them to a third-party SMS gateway (SMSAPI). If you deploy this for real clients, that's personal data processing — check it against GDPR before going live.
+
 ## How it works
 
 1. The salon owner adds an appointment to their Google Calendar in this format:
@@ -252,3 +256,7 @@ affected by any of the three.
 the last hour, so a move made during a longer outage is missed permanently. The client still has the
 correct time if the appointment has not yet been reminded, and the reminder itself always quotes the
 current start.
+
+## Licence
+
+[MIT](LICENSE)

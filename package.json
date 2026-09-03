@@ -2,6 +2,7 @@
   "name": "salon-sms-reminder",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "SMS appointment reminders for a hair salon, driven entirely by Google Calendar",
   "scripts": {
