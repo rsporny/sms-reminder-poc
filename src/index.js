@@ -13,7 +13,7 @@
  * @property {string} GOOGLE_SA_PRIVATE_KEY secret: PEM private key (literal \n sequences)
  * @property {string} SMSAPI_TOKEN        secret: SMSAPI OAuth token
  * @property {string} CALLBACK_SECRET     secret: shared secret in the callback query string
- * @property {string} CALENDAR_ID         var: calendar to watch
+ * @property {string} CALENDAR_ID         secret: calendar to watch
  * @property {string} SALON_NAME          var: used in the SMS body
  * @property {string} SALON_PHONE         var: cancellation number in the SMS body
  *

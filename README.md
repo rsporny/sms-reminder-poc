@@ -92,8 +92,9 @@ wrangler secret put GOOGLE_SA_EMAIL        # service account e-mail
 wrangler secret put GOOGLE_SA_PRIVATE_KEY  # private_key from the JSON (with \n)
 wrangler secret put SMSAPI_TOKEN
 wrangler secret put CALLBACK_SECRET        # random string appended to the callback URL
+wrangler secret put CALENDAR_ID            # Calendar ID from step 1.4
 ```
-Non-secret config goes in `wrangler.toml` (`[vars]`): `CALENDAR_ID`, `SALON_NAME`, `SALON_PHONE`.
+Non-secret config goes in `wrangler.toml` (`[vars]`): `SALON_NAME`, `SALON_PHONE`.
 
 In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy workflow).
 
@@ -133,13 +134,14 @@ npx wrangler dev              # local server on :8787
 ```
 
 For `wrangler dev`, put dummy values in a `.dev.vars` file (gitignored) so the Worker has
-something to read for the four secrets:
+something to read for the five secrets:
 
 ```
 GOOGLE_SA_EMAIL = "dev@example.iam.gserviceaccount.com"
 GOOGLE_SA_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n"
 SMSAPI_TOKEN = "dev-token"
 CALLBACK_SECRET = "test"
+CALENDAR_ID = "c_a1b2c3...@group.calendar.google.com"
 ```
 
 Calls to Google will fail with dummy credentials — that is expected, and the routing, secret
@@ -216,7 +218,7 @@ a 500 would put SMSAPI into a permanent retry loop.
 
 **Google returns 404 for the calendar.** The service account hasn't been given access. Share the
 calendar with the service account's e-mail with *"Make changes to events"* (see One-time setup),
-and check `CALENDAR_ID` in `wrangler.toml` — it is the ID from *Settings → Integrate calendar*,
+and check the `CALENDAR_ID` secret — it is the ID from *Settings → Integrate calendar*,
 not the calendar's display name.
 
 **Google returns 401 `invalid_grant`.** Usually the private key. `GOOGLE_SA_PRIVATE_KEY` must be

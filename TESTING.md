@@ -115,11 +115,10 @@ on the appointment whose SMS you actually answered.
 Deploying gives you a **stable** callback URL for SMSAPI and the real 15-minute cron. Do this
 before touching the SMSAPI callback settings.
 
-Set the two config values in `wrangler.toml`:
+Set the two non-secret config values in `wrangler.toml`:
 
 ```toml
 [vars]
-CALENDAR_ID = "c_a1b2c3...@group.calendar.google.com"
 SALON_NAME  = "Salon Test"
 SALON_PHONE = "500100200"
 ```
@@ -138,6 +137,8 @@ echo 'YOUR_SMSAPI_TOKEN'       | npx wrangler secret put SMSAPI_TOKEN
 set callback_secret (openssl rand -hex 16)
 echo $callback_secret | npx wrangler secret put CALLBACK_SECRET
 echo "callback secret: $callback_secret"   # you need this for the SMSAPI panel
+
+echo 'YOUR_CALENDAR_ID' | npx wrangler secret put CALENDAR_ID   # from Settings → Integrate calendar
 ```
 
 Piping the PEM avoids the multi-line paste problem entirely. Real newlines and literal `\n`
@@ -209,6 +210,7 @@ begin
   echo "GOOGLE_SA_EMAIL = \"$(jq -r '.client_email' $keyfile)\""
   echo "SMSAPI_TOKEN = \"YOUR_SMSAPI_TOKEN\""
   echo "CALLBACK_SECRET = \"$callback_secret\""
+  echo "CALENDAR_ID = \"YOUR_CALENDAR_ID\""
 end > .dev.vars
 ```
 
