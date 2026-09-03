@@ -2,6 +2,10 @@
 
 A zero-maintenance SMS appointment reminder system for a hair salon, built on **Google Calendar** (the only tool the salon owner touches) and **Cloudflare Workers** (all the logic, $0 infrastructure).
 
+> **Status:** proof of concept, not a hardened production service.
+>
+> **Personal data:** the Worker reads client names and phone numbers from Google Calendar event titles and sends them to a third-party SMS gateway (SMSAPI). If you deploy this for real clients, that's personal data processing — check it against GDPR before going live.
+
 ## How it works
 
 1. The salon owner adds an appointment to their Google Calendar in this format:
@@ -70,7 +74,7 @@ The owner never operates any application other than their calendar.
 - **Runtime:** Cloudflare Workers (Free plan), 1 Cron Trigger `*/15 * * * *`
 - **Calendar:** Google Calendar API v3 via plain `fetch()` — no `googleapis` SDK (doesn't run on Workers); auth: service account + RS256 JWT signed with `crypto.subtle`
 - **SMS:** SMSAPI.pl — 2Way sending (shared inbound number), replies received via callback URL
-- **Deploy:** GitHub Actions → `cloudflare/wrangler-action` → `wrangler deploy` on push to `main`
+- **Deploy:** manual — `npx wrangler deploy` (no CI/CD; this is a PoC)
 - **Language:** JavaScript/TypeScript, zero runtime dependencies
 
 ## One-time setup
@@ -86,16 +90,17 @@ The owner never operates any application other than their calendar.
 2. Activate **2Way** sending (an inbound number from the shared pool).
 3. Panel → **Callback addresses** → "Incoming SMS" → enter the Worker URL: `https://<worker>.workers.dev/sms-callback`.
 
-### 3. Cloudflare + GitHub
+### 3. Cloudflare
 ```bash
 wrangler secret put GOOGLE_SA_EMAIL        # service account e-mail
 wrangler secret put GOOGLE_SA_PRIVATE_KEY  # private_key from the JSON (with \n)
 wrangler secret put SMSAPI_TOKEN
 wrangler secret put CALLBACK_SECRET        # random string appended to the callback URL
+wrangler secret put CALENDAR_ID            # Calendar ID from step 1.4
 ```
-Non-secret config goes in `wrangler.toml` (`[vars]`): `CALENDAR_ID`, `SALON_NAME`, `SALON_PHONE`.
+Non-secret config goes in `wrangler.toml` (`[vars]`): `SALON_NAME`, `SALON_PHONE`.
 
-In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy workflow).
+Deploy with `npx wrangler deploy` — there is no CI/CD, so run it by hand whenever `src/index.js` or `wrangler.toml` changes.
 
 ## Costs
 
@@ -116,8 +121,6 @@ In the GitHub repo, add the `CLOUDFLARE_API_TOKEN` secret (used by the deploy wo
 │   └── index.test.js     # vitest over the pure functions
 ├── wrangler.toml
 ├── package.json
-├── .github/workflows/
-│   └── deploy.yml
 ├── README.md
 ├── TESTING.md            # live end-to-end runbook
 └── CLAUDE.md             # instructions for Claude Code
@@ -133,13 +136,14 @@ npx wrangler dev              # local server on :8787
 ```
 
 For `wrangler dev`, put dummy values in a `.dev.vars` file (gitignored) so the Worker has
-something to read for the four secrets:
+something to read for the five secrets:
 
 ```
 GOOGLE_SA_EMAIL = "dev@example.iam.gserviceaccount.com"
 GOOGLE_SA_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n"
 SMSAPI_TOKEN = "dev-token"
 CALLBACK_SECRET = "test"
+CALENDAR_ID = "c_a1b2c3...@group.calendar.google.com"
 ```
 
 Calls to Google will fail with dummy credentials — that is expected, and the routing, secret
@@ -216,7 +220,7 @@ a 500 would put SMSAPI into a permanent retry loop.
 
 **Google returns 404 for the calendar.** The service account hasn't been given access. Share the
 calendar with the service account's e-mail with *"Make changes to events"* (see One-time setup),
-and check `CALENDAR_ID` in `wrangler.toml` — it is the ID from *Settings → Integrate calendar*,
+and check the `CALENDAR_ID` secret — it is the ID from *Settings → Integrate calendar*,
 not the calendar's display name.
 
 **Google returns 401 `invalid_grant`.** Usually the private key. `GOOGLE_SA_PRIVATE_KEY` must be
@@ -250,3 +254,7 @@ affected by any of the three.
 the last hour, so a move made during a longer outage is missed permanently. The client still has the
 correct time if the appointment has not yet been reminded, and the reminder itself always quotes the
 current start.
+
+## Licence
+
+[MIT](LICENSE)

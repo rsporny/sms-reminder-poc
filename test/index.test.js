@@ -10,6 +10,7 @@ import {
   maskPhone,
   needsReconfirmation,
   parsePhone,
+  secretsMatch,
   selectDueEvents,
   selectNewEvents,
   selectRescheduledEvents,
@@ -210,6 +211,27 @@ describe("isConfirmation", () => {
     "treats %j as not a confirmation",
     (reply) => expect(isConfirmation(reply)).toBe(false),
   );
+});
+
+describe("secretsMatch", () => {
+  it("matches equal strings", () => {
+    expect(secretsMatch("abc123", "abc123")).toBe(true);
+  });
+
+  it("rejects unequal strings of the same length", () => {
+    expect(secretsMatch("abc123", "abc124")).toBe(false);
+  });
+
+  it("rejects strings of different length", () => {
+    expect(secretsMatch("abc", "abc123")).toBe(false);
+  });
+
+  it("treats missing/undefined/null as empty strings, not a match against a real secret", () => {
+    expect(secretsMatch(null, "abc123")).toBe(false);
+    expect(secretsMatch(undefined, "abc123")).toBe(false);
+    expect(secretsMatch(null, "")).toBe(true);
+    expect(secretsMatch(undefined, undefined)).toBe(true);
+  });
 });
 
 describe("selectDueEvents", () => {

@@ -13,7 +13,7 @@
  * @property {string} GOOGLE_SA_PRIVATE_KEY secret: PEM private key (literal \n sequences)
  * @property {string} SMSAPI_TOKEN        secret: SMSAPI OAuth token
  * @property {string} CALLBACK_SECRET     secret: shared secret in the callback query string
- * @property {string} CALENDAR_ID         var: calendar to watch
+ * @property {string} CALENDAR_ID         secret: calendar to watch
  * @property {string} SALON_NAME          var: used in the SMS body
  * @property {string} SALON_PHONE         var: cancellation number in the SMS body
  *
@@ -109,6 +109,15 @@ export function isConfirmation(text) {
   if (!text) return false;
   const normalized = gsmSanitize(text).toLowerCase();
   return /(?:^|[^\p{L}\p{N}])(?:tak|ok|potwierdzam)(?:[^\p{L}\p{N}]|$)/u.test(normalized);
+}
+
+/** Length-independent, constant-time-ish compare — no early exit on the first differing byte. */
+export function secretsMatch(a, b) {
+  const x = new TextEncoder().encode(String(a ?? ""));
+  const y = new TextEncoder().encode(String(b ?? ""));
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+  return diff === 0;
 }
 
 /**
@@ -747,7 +756,7 @@ const MSG_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
  * @param {Env} env
  */
 async function handleCallback(request, env) {
-  if (new URL(request.url).searchParams.get("secret") !== env.CALLBACK_SECRET) {
+  if (!secretsMatch(new URL(request.url).searchParams.get("secret"), env.CALLBACK_SECRET)) {
     console.log("callback rejected: bad or missing secret");
     return new Response("forbidden", { status: 403 });
   }
