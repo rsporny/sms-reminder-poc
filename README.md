@@ -32,10 +32,22 @@ A zero-maintenance SMS appointment reminder system for a hair salon, built on **
    | default | future appointment, no reminder sent yet (a booking SMS leaves the color alone) |
    | 🟡 yellow (`colorId: 5`) | confirmation asked, waiting for the reply |
    | 🟢 green (`colorId: 10`) + `✅` in title | client confirmed |
-   | 🔴 red (`colorId: 11`) | no reply 4h after the last ask → **call this client** |
+   | 🔴 red (`colorId: 11`) | no reply 4h after the last ask, **or** the client replied something that isn't a confirmation → **call this client** |
 
    Moving a green or yellow appointment resets it to yellow (clearing the `✅`) and restarts the 4h
    clock, because the client is being asked about a different time.
+
+7. When a client replies anything other than a confirmation — "nie mogę", "czy da się w czwartek?" —
+   the Worker appends it to the event description and turns the event red, so the owner reads the
+   client's own words in the calendar:
+
+   ```
+   Anna, farbowanie
+   500 123 456
+
+   --- SMS czw 27.08 14:32 ---
+   Nie mogę, przepraszam
+   ```
 
 The owner never operates any application other than their calendar.
 
@@ -57,8 +69,10 @@ The owner never operates any application other than their calendar.
 │   • yellow > 4h with no reply → red          │
 │                                              │
 │  fetch() – POST /sms-callback (from SMSAPI)  │
-│   • body ≈ "TAK" → match on MsgId            │
-│   • ✅ + green + confirmed flag              │
+│   • match the reply on MsgId                 │
+│   • "TAK" → ✅ + green + confirmed flag      │
+│   • anything else → red + reply appended to  │
+│     the event description                    │
 │   • respond with body "OK" (SMSAPI requires) │
 └───────┬──────────────────────────────────────┘
         │ REST API
@@ -180,6 +194,14 @@ event ghi789: reminder sent to 48500***456
 event jkl012: no reply after 4h — marked red
 ```
 
+Callback lines land separately, as replies arrive:
+
+```
+event ghi789: confirmed by 48500***456
+event ghi789: reply recorded from 48500***456 — "Nie mogę, przepraszam"
+callback: MsgId 1460969715572091219 matches no upcoming appointment — superseded or stale
+```
+
 Numbers are always masked in logs; a full client number should never appear.
 
 To trigger the cron by hand instead of waiting up to 15 minutes, run `wrangler dev` and hit its
@@ -205,10 +227,21 @@ curl -X POST 'http://localhost:8787/sms-callback?secret=test' \
   -d 'sms_from=48500123456' -d 'sms_text=TAK' -d 'MsgId=1460969715572091219'
 ```
 
-`MsgId` is what identifies the appointment — it is the id of the 2way message being replied to, and
-the Worker stores the id of the last message that *asked* for confirmation. Omit it and the reply is
-acknowledged but matches nothing, which is also what happens when a client replies to the
-informational booking SMS.
+`MsgId` is what identifies the appointment — it is the id of the 2way message being replied to. The
+Worker stores two ids per event: `confirmAskMsgId` (the last message that *asked* for TAK) and
+`lastMsgId` (the last message of any kind). A `TAK` matches only the first, so replying "TAK" to the
+informational booking SMS still confirms nothing; anything else matches the second, so a
+cancellation sent straight back at the booking SMS is still recorded. Omit `MsgId` and the reply is
+acknowledged but matches nothing.
+
+To see the non-confirmation path, post something that isn't a confirmation against an event's
+`lastMsgId` — the event turns red and gains the reply in its description:
+
+```bash
+curl -X POST 'http://localhost:8787/sms-callback?secret=test' \
+  -d 'sms_from=48500123456' -d 'sms_text=Nie mogę, przepraszam' \
+  -d 'MsgId=1460969715572091219' -d 'sms_date=1756290720'
+```
 
 Expected responses:
 
@@ -216,9 +249,10 @@ Expected responses:
 |---|---|---|
 | correct `secret` | 200 | `OK` |
 | wrong or missing `secret` | 403 | `forbidden` |
-| reply that isn't a confirmation | 200 | `OK` (logged as non-confirmation) |
-| `TAK` with no usable `MsgId` | 200 | `OK` (logged with the field names received) |
-| `MsgId` matching no pending ask | 200 | `OK` (logged as superseded or informational) |
+| reply that isn't a confirmation | 200 | `OK` (event turns red, reply appended to its description) |
+| reply with no usable `MsgId` | 200 | `OK` (logged with the field names received) |
+| `MsgId` matching no upcoming appointment | 200 | `OK` (logged as superseded or stale) |
+| the same reply redelivered | 200 | `OK` (the description is not duplicated) |
 
 The body is `OK` on every 200 path including internal errors — that is deliberate, see below.
 
@@ -246,6 +280,17 @@ ignores longer digit runs so an invoice number in the title isn't mistaken for a
 appointment created less than 23h ahead never gets a reminder. This is by design — a reminder
 sent 3h before the slot has little value and risks annoying the client. Such an appointment still
 gets its booking acknowledgement, which carries the date and time.
+
+**A client's reply isn't on the event.** It only lands there if it matched an appointment — look
+for `matches no upcoming appointment`. Three by-design reasons: the appointment has already started
+(matching only looks at future events); the client replied to an older message rather than the
+newest one (both ids are overwritten on every send, so only the latest message is matchable); or
+the appointment predates this feature and was only ever sent a booking acknowledgement, which used
+to store no id at all — the fallback to `confirmAskMsgId` covers older *reminders*, not those.
+
+**A red event's description shows a reply but the title still has `✅`.** Shouldn't happen — the
+`✅` and `confirmedAt` are cleared whenever a reply arrives for a confirmed appointment. If you see
+it, the patch failed halfway; check for `callback error (acknowledged anyway)` in the log.
 
 **Confirmations stopped working entirely — every reply logs "without a usable MsgId".** Replies are
 matched only on `MsgId`, the id of the 2way message being answered

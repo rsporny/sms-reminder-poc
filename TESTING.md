@@ -279,10 +279,25 @@ Other replies worth trying:
 | `Tak, będę` | confirms (keyword match, diacritics irrelevant) |
 | `ok` | confirms |
 | `potwierdzam` | confirms |
-| `NIE MOGE` | no change; logged `non-confirmation from 48501***...` |
+| `NIE MOGE` | 🔴 red, and the reply appended to the event description |
 
-A non-confirmation is deliberately *not* a cancellation — it is logged for the owner to read,
-nothing more.
+**Check the calendar after `NIE MOGE`:** the appointment is red and its description ends with
+
+```
+--- SMS czw 27.08 14:32 ---
+NIE MOGE
+```
+
+directly under whatever notes you had there — those are never touched. The timestamp is Polish
+local time. Send the same reply again: the description must not gain a second identical block
+(SMSAPI redelivers a callback until it sees `OK`).
+
+A non-confirmation is deliberately *not* a cancellation — the Worker cancels nothing. It puts the
+client's own words in front of the owner and turns the light red so they make the call.
+
+Now confirm an appointment with `TAK` (green, `✅`) and then reply `jednak nie dam rady` to the same
+message. Expected: red, the reply in the description, the `✅` gone from the title and `confirmedAt`
+cleared — a confirmed title under a red light would contradict itself.
 
 ---
 
@@ -325,8 +340,14 @@ Expected: `event <id>: booking sms sent to 48500***456`, one SMS reading *"rezer
 na …"*, `bookingSmsSentAt` / `notifiedStart` / `clientPhone` on the event, and **no color change**.
 Trigger again — the tick must report `0 new` and send nothing.
 
-Reply **TAK** to that booking SMS. Expected: `MsgId … answers no pending ask` and the appointment
-stays grey. The booking message is informational; only a reminder or a reschedule can be confirmed.
+Reply **TAK** to that booking SMS. Expected: `MsgId … matches no upcoming appointment` and the
+appointment stays grey. The booking message is informational; only a reminder or a reschedule can
+be confirmed.
+
+Now reply **`musze odwolac`** to that same booking SMS. Expected: 🔴 red and the reply in the
+description. This is the asymmetry to check — a "TAK" to the booking SMS confirms nothing, but a
+cancellation sent back at it still reaches the owner, because non-confirmations match on
+`lastMsgId`, which every outgoing message sets.
 
 **Reschedule, informational.** Drag the appointment to another hour, trigger the cron. Expected:
 one `reschedule sms sent to … (askConfirm=false)`, an SMS reading *"zmiana terminu wizyty na …"*
@@ -337,8 +358,11 @@ with no TAK ask, `notifiedStart` updated, color still unchanged.
 `askConfirm=true`, an SMS that *does* ask for TAK, still yellow, both flags refreshed.
 
 Now reply TAK **to the older reminder** (pick that message on the handset, not the newest one).
-Expected: `MsgId … answers no pending ask` — the appointment stays yellow, because that id was
-superseded. Reply TAK to the newest message instead → 🟢 green with `✅`.
+Expected: `MsgId … matches no upcoming appointment` — the appointment stays yellow, because that id
+was superseded as an *ask*. Reply TAK to the newest message instead → 🟢 green with `✅`.
+
+Reply `nie moge` to that same superseded reminder and nothing is recorded either: both ids are
+overwritten by every new send, so only the *newest* message the client holds can be matched at all.
 
 **Reschedule of a confirmed appointment.** With it green, move it once more and trigger. Expected:
 `askConfirm=true`, the appointment back to 🟡 yellow, the `✅` gone from the title and `confirmedAt`
