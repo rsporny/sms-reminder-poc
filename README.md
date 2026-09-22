@@ -88,14 +88,24 @@ The owner never operates any application other than their calendar.
 ### 2. SMSAPI
 1. Register at [smsapi.pl](https://www.smsapi.pl) and generate an **OAuth token** (Panel → API → Tokens).
 2. Activate **2Way** sending (an inbound number from the shared pool).
-3. Panel → **Callback addresses** → "Incoming SMS" → enter the Worker URL: `https://<worker>.workers.dev/sms-callback`.
+3. Panel → **Callback addresses** → "Incoming SMS" → enter the Worker URL, **including the `secret` query param**: `https://<worker>.workers.dev/sms-callback?secret=<CALLBACK_SECRET>`.
+   The value must match the `CALLBACK_SECRET` secret set in step 3; without it the Worker answers 403 and SMSAPI redelivers every reply forever.
 
 ### 3. Cloudflare
+
+Generate the callback secret first — the same value is needed twice, here and in the
+SMSAPI callback URL (step 2.3):
+
+```fish
+set callback_secret (openssl rand -hex 16)
+echo $callback_secret
+```
+
 ```bash
 wrangler secret put GOOGLE_SA_EMAIL        # service account e-mail
 wrangler secret put GOOGLE_SA_PRIVATE_KEY  # private_key from the JSON (with \n)
 wrangler secret put SMSAPI_TOKEN
-wrangler secret put CALLBACK_SECRET        # random string appended to the callback URL
+wrangler secret put CALLBACK_SECRET        # paste $callback_secret from above
 wrangler secret put CALENDAR_ID            # Calendar ID from step 1.4
 ```
 Non-secret config goes in `wrangler.toml` (`[vars]`): `SALON_NAME`, `SALON_PHONE`.
