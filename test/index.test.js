@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  appendReply,
   buildBookingMessage,
   buildMessage,
   buildRescheduleMessage,
@@ -10,11 +11,13 @@ import {
   maskPhone,
   needsReconfirmation,
   parsePhone,
+  parseSmsDate,
   secretsMatch,
   selectDueEvents,
   selectNewEvents,
   selectRescheduledEvents,
   selectStaleEvents,
+  stripReplyLog,
   withCheck,
   withoutCheck,
 } from "../src/index.js";
@@ -393,5 +396,97 @@ describe("withoutCheck", () => {
 
   it("round-trips with withCheck", () => {
     expect(withoutCheck(withCheck("Anna Kowalska"))).toBe("Anna Kowalska");
+  });
+});
+
+describe("appendReply", () => {
+  const AT = new Date("2026-08-27T12:32:00Z"); // 14:32 in Warsaw (CEST)
+
+  it("appends under the owner's own notes", () => {
+    expect(appendReply("Anna, farbowanie", "Nie moge, przepraszam", AT)).toBe(
+      "Anna, farbowanie\n\n--- SMS czw 27.08 14:32 ---\nNie moge, przepraszam",
+    );
+  });
+
+  it("stamps the note in Polish local time across the CET/CEST switch", () => {
+    const winter = new Date("2026-01-15T12:32:00Z"); // CET, +1
+    expect(appendReply("", "zima", winter)).toBe("--- SMS czw 15.01 13:32 ---\nzima");
+    expect(appendReply("", "lato", AT)).toBe("--- SMS czw 27.08 14:32 ---\nlato");
+  });
+
+  it("keeps the replies in order, newest last", () => {
+    const first = appendReply("notatki", "Nie moge", AT);
+    const both = appendReply(first, "Czy da sie w czwartek?", new Date("2026-08-27T13:01:00Z"));
+    expect(both).toBe(
+      "notatki\n\n--- SMS czw 27.08 14:32 ---\nNie moge" +
+        "\n\n--- SMS czw 27.08 15:01 ---\nCzy da sie w czwartek?",
+    );
+  });
+
+  it("keeps the client's diacritics — a description is not an SMS", () => {
+    expect(appendReply("", "Nie mogę, przepraszam", AT)).toContain("Nie mogę, przepraszam");
+  });
+
+  it("ignores a redelivered callback instead of duplicating the note", () => {
+    const once = appendReply("notatki", "Nie moge", AT);
+    expect(appendReply(once, "Nie moge", AT)).toBe(once);
+  });
+
+  it("truncates one very long reply", () => {
+    const note = appendReply("", "x".repeat(500), AT);
+    expect(note).toBe(`--- SMS czw 27.08 14:32 ---\n${"x".repeat(300)}`);
+  });
+
+  it("drops the oldest replies rather than outgrow the description limit", () => {
+    let desc = "notatki wlascicielki";
+    for (let i = 0; i < 60; i++) {
+      desc = appendReply(desc, `${"x".repeat(290)}-${i}`, new Date(AT.getTime() + i * 60_000));
+    }
+    expect(desc.length).toBeLessThanOrEqual(8000);
+    expect(desc.startsWith("notatki wlascicielki")).toBe(true); // never the owner's notes
+    expect(desc).toContain(`${"x".repeat(290)}-59`); // newest kept
+    expect(desc).not.toContain(`${"x".repeat(290)}-0\n`); // oldest dropped
+  });
+});
+
+describe("stripReplyLog", () => {
+  const AT = new Date("2026-08-27T12:32:00Z");
+
+  it("leaves a description without recorded replies untouched", () => {
+    expect(stripReplyLog("Anna, farbowanie\n500 123 456")).toBe("Anna, farbowanie\n500 123 456");
+    expect(stripReplyLog(null)).toBe("");
+  });
+
+  it("round-trips with appendReply", () => {
+    expect(stripReplyLog(appendReply("notatki", "Nie moge", AT))).toBe("notatki");
+  });
+
+  it("stops a number quoted in a reply from becoming the number we text", () => {
+    const desc = appendReply("Anna, farbowanie", "moj numer to 600 999 888", AT);
+    expect(parsePhone(`Anna ${desc}`)).toBe("48600999888"); // the bug this guard exists for
+    expect(parsePhone(`Anna ${stripReplyLog(desc)}`)).toBeNull();
+  });
+
+  it("still finds a number that lives in the description itself", () => {
+    const desc = appendReply("zadzwonic 500 123 456", "moj numer to 600 999 888", AT);
+    expect(parsePhone(`Anna ${stripReplyLog(desc)}`)).toBe("48500123456");
+  });
+});
+
+describe("parseSmsDate", () => {
+  it("reads SMSAPI's unix seconds", () => {
+    expect(parseSmsDate("1756290720")?.toISOString()).toBe("2025-08-27T10:32:00.000Z");
+  });
+
+  it.each([["", "missing"], ["abc", "not a number"], ["1756290720000000", "absurdly long"]])(
+    "falls back to null for %p (%s)",
+    (raw) => {
+      expect(parseSmsDate(raw)).toBeNull();
+    },
+  );
+
+  it("falls back to null for a missing field", () => {
+    expect(parseSmsDate(null)).toBeNull();
+    expect(parseSmsDate(undefined)).toBeNull();
   });
 });

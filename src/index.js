@@ -32,6 +32,13 @@ const HOUR = 3600_000;
 const TZ = "Europe/Warsaw";
 const CHECK = "✅";
 
+/** Header line of one recorded client reply — the anchor both reply helpers key off. */
+const REPLY_MARK_RE = /^--- SMS .+ ---$/m;
+/** One reply, truncated. Room for a sentence, not enough to bloat the event. */
+const REPLY_MAX = 300;
+/** Google's own description cap is 8192; stay clear of it. */
+const DESC_MAX = 8000;
+
 /** How far back the booking pass trusts `created` — 4 cron ticks of slack. */
 const BOOKING_LOOKBACK = HOUR;
 
@@ -342,6 +349,68 @@ export function withoutCheck(summary) {
   return (summary ?? "").replace(new RegExp(`^\\s*${CHECK}\\s*`), "").trim();
 }
 
+/**
+ * Append one client reply to the event description — the only place the owner will see it.
+ * Newest last, under whatever notes the owner keeps at the top.
+ *
+ * Idempotent on an identical block: SMSAPI redelivers a callback until it sees `OK`, and a
+ * redelivery must not duplicate the note (same contract as `withCheck`).
+ *
+ * The reply is stored verbatim, diacritics included — a description is not an SMS, so the GSM-7
+ * limit that shapes the outgoing templates does not apply here.
+ *
+ * @param {string|null|undefined} description current event description
+ * @param {string} text the client's reply
+ * @param {Date|string} at when the reply arrived
+ * @returns {string}
+ */
+export function appendReply(description, text, at) {
+  const { date, time } = formatWhen(at instanceof Date ? at.toISOString() : at);
+  const block = `--- SMS ${date} ${time} ---\n${String(text ?? "").trim().slice(0, REPLY_MAX)}`;
+
+  const existing = (description ?? "").trimEnd();
+  if (existing.includes(block)) return description ?? "";
+
+  let result = existing ? `${existing}\n\n${block}` : block;
+  // Too long: drop whole blocks off the front of the log, oldest first — never the owner's notes.
+  while (result.length > DESC_MAX) {
+    const first = result.search(REPLY_MARK_RE);
+    const next = result.slice(first + 1).search(REPLY_MARK_RE);
+    if (first === -1 || next === -1) break; // one block left — nothing safe to drop
+    result = result.slice(0, first) + result.slice(first + 1 + next);
+  }
+  return result;
+}
+
+/**
+ * The description with the recorded replies cut off.
+ *
+ * `parsePhone` is fed `title + description` and returns the *first* nine-digit run, so a number
+ * quoted inside a client's reply would otherwise become the number we text — for an event that
+ * carries the client's number in the description alone, that is a message to the wrong person.
+ *
+ * @param {string|null|undefined} description
+ * @returns {string}
+ */
+export function stripReplyLog(description) {
+  const text = description ?? "";
+  const at = text.search(REPLY_MARK_RE);
+  return at === -1 ? text : text.slice(0, at).trimEnd();
+}
+
+/**
+ * SMSAPI stamps an incoming message with `sms_date`, a unix timestamp in seconds. Absent or
+ * unparseable → null, and the caller stamps the note with its own clock instead.
+ *
+ * @param {string|null|undefined} raw
+ * @returns {Date|null}
+ */
+export function parseSmsDate(raw) {
+  if (!/^\d{1,13}$/.test(String(raw ?? "").trim())) return null;
+  const when = new Date(Number(raw) * 1000);
+  return Number.isNaN(when.getTime()) ? null : when;
+}
+
 /* ------------------------------------------------------------------ *
  * Google auth
  * ------------------------------------------------------------------ */
@@ -528,6 +597,7 @@ function askProps(sendResult, start, now, eventId) {
     notifiedStart: start,
     confirmAskedAt: now.toISOString(),
     confirmAskMsgId: msgId,
+    lastMsgId: msgId,
   };
 }
 
@@ -541,14 +611,14 @@ function askProps(sendResult, start, now, eventId) {
  * @param {Date} now
  */
 async function sendBookingSms(env, token, ev, now) {
-  const phone = parsePhone(`${ev.summary ?? ""} ${ev.description ?? ""}`);
+  const phone = parsePhone(`${ev.summary ?? ""} ${stripReplyLog(ev.description)}`);
   if (!phone) {
     console.log(`event ${ev.id}: no phone number in title/description — skipped`);
     return;
   }
 
   const start = /** @type {string} */ (ev.start?.dateTime);
-  await sendSms(
+  const sent = await sendSms(
     env,
     phone,
     buildBookingMessage({ salonName: env.SALON_NAME, salonPhone: env.SALON_PHONE, start }),
@@ -561,6 +631,7 @@ async function sendBookingSms(env, token, ev, now) {
         bookingSmsSentAt: now.toISOString(),
         clientPhone: phone,
         notifiedStart: start,
+        lastMsgId: extractMsgId(sent),
       },
     },
   });
@@ -579,7 +650,8 @@ async function sendBookingSms(env, token, ev, now) {
  */
 async function sendRescheduleSms(env, token, ev, now) {
   const priv = ev.extendedProperties?.private ?? {};
-  const phone = priv.clientPhone ?? parsePhone(`${ev.summary ?? ""} ${ev.description ?? ""}`);
+  const phone =
+    priv.clientPhone ?? parsePhone(`${ev.summary ?? ""} ${stripReplyLog(ev.description)}`);
   if (!phone) {
     console.log(`event ${ev.id}: no phone number in title/description — skipped`);
     return;
@@ -612,7 +684,11 @@ async function sendRescheduleSms(env, token, ev, now) {
             private: { ...priv, confirmedAt: null, ...askProps(sent, start, now, ev.id) },
           },
         }
-      : { extendedProperties: { private: { ...priv, notifiedStart: start } } },
+      : {
+          extendedProperties: {
+            private: { ...priv, notifiedStart: start, lastMsgId: extractMsgId(sent) },
+          },
+        },
   );
   console.log(
     `event ${ev.id}: reschedule sms sent to ${maskPhone(phone)} (askConfirm=${askConfirm})`,
@@ -631,7 +707,7 @@ async function sendRescheduleSms(env, token, ev, now) {
  * @param {Date} now
  */
 async function sendReminder(env, token, ev, now) {
-  const phone = parsePhone(`${ev.summary ?? ""} ${ev.description ?? ""}`);
+  const phone = parsePhone(`${ev.summary ?? ""} ${stripReplyLog(ev.description)}`);
   if (!phone) {
     console.log(`event ${ev.id}: no phone number in title/description — skipped`);
     return;
@@ -742,12 +818,17 @@ const okResponse = () =>
 const MSG_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
 /**
- * SMSAPI incoming-SMS webhook. Fields are `sms_from` / `sms_text` / `MsgId`, form-encoded.
+ * SMSAPI incoming-SMS webhook. Fields are `sms_from` / `sms_text` / `sms_date` / `MsgId`,
+ * form-encoded.
  *
- * `MsgId` is the id of the 2way message being replied to, which is the only reliable link between
- * a "TAK" and the appointment it answers — a client may be holding a booking SMS, an old reminder
- * and a reschedule notice at once. We store the id of the last message that *asked* for
- * confirmation, so a reply to anything else matches nothing and is ignored.
+ * `MsgId` is the id of the 2way message being replied to, and the only reliable link between a
+ * reply and the appointment it answers — a client may be holding a booking SMS, an old reminder
+ * and a reschedule notice at once. Two ids are stored per event, answering different questions:
+ *
+ * - `confirmAskMsgId` — the last message that *asked* for TAK. Only a reply to that one can
+ *   confirm, so a "TAK" sent back at the informational booking acknowledgement confirms nothing.
+ * - `lastMsgId` — the last message of any kind. Anything that is not a confirmation is recorded
+ *   against this, so "nie moge" fired straight back at the booking SMS still reaches the owner.
  *
  * Every outcome answers 200 with the body `OK` — SMSAPI redelivers indefinitely without it,
  * so even an internal failure is logged and acknowledged rather than surfaced as a 500.
@@ -765,45 +846,66 @@ async function handleCallback(request, env) {
     const form = new URLSearchParams(await request.text());
     const phone = parsePhone(form.get("sms_from")); // logging only — MsgId does the matching
     const body = form.get("sms_text") ?? "";
-    if (!isConfirmation(body)) {
-      // Not a "yes" — possibly a cancellation, so leave a trace for the owner.
-      console.log(`callback: non-confirmation from ${maskPhone(phone)}: ${JSON.stringify(body)}`);
-      return okResponse();
-    }
+    const confirms = isConfirmation(body);
 
     const msgId = form.get("MsgId") ?? "";
     if (!MSG_ID_RE.test(msgId)) {
       // Nothing to match on. Log which fields did arrive — that is the diagnostic if SMSAPI ever
       // stops sending MsgId (documented as empty for replies to a dedicated number).
       console.log(
-        `callback: confirmation from ${maskPhone(phone)} without a usable MsgId — ` +
-          `fields received: ${[...form.keys()].join(", ")}`,
+        `callback: reply from ${maskPhone(phone)} without a usable MsgId ` +
+          `(confirmation=${confirms}) — fields received: ${[...form.keys()].join(", ")}`,
       );
       return okResponse();
     }
 
     const now = new Date();
     const token = await getAccessToken(env);
-    const [match] = await listEvents(env, token, {
-      timeMin: now.toISOString(),
-      privateExtendedProperty: `confirmAskMsgId=${msgId}`,
-    });
+    const findBy = async (key) => {
+      const [found] = await listEvents(env, token, {
+        timeMin: now.toISOString(),
+        privateExtendedProperty: `${key}=${msgId}`,
+      });
+      return found;
+    };
+
+    // A confirmation matches an outstanding ask and nothing else. Anything else falls back to
+    // confirmAskMsgId for appointments messaged before lastMsgId existed.
+    const match = confirms
+      ? await findBy("confirmAskMsgId")
+      : ((await findBy("lastMsgId")) ?? (await findBy("confirmAskMsgId")));
     if (!match) {
-      console.log(`callback: MsgId ${msgId} answers no pending ask — superseded or informational`);
+      console.log(`callback: MsgId ${msgId} matches no upcoming appointment — superseded or stale`);
       return okResponse();
     }
 
+    const priv = match.extendedProperties?.private ?? {};
+    if (confirms) {
+      await patchEvent(env, token, match.id, {
+        colorId: GREEN,
+        ...(match.summary ? { summary: withCheck(match.summary) } : {}),
+        extendedProperties: { private: { ...priv, confirmedAt: now.toISOString() } },
+      });
+      console.log(`event ${match.id}: confirmed by ${maskPhone(phone)}`);
+      return okResponse();
+    }
+
+    // Not a "yes" — a cancellation, a question, anything at all. Put it where the owner looks and
+    // turn the event red: this one needs a phone call. Red also parks it, since selectStaleEvents
+    // skips events that are already red.
     await patchEvent(env, token, match.id, {
-      colorId: GREEN,
-      ...(match.summary ? { summary: withCheck(match.summary) } : {}),
-      extendedProperties: {
-        private: {
-          ...(match.extendedProperties?.private ?? {}),
-          confirmedAt: now.toISOString(),
-        },
-      },
+      colorId: RED,
+      description: appendReply(match.description, body, parseSmsDate(form.get("sms_date")) ?? now),
+      // A "✅ confirmed" title under a red light contradicts itself — the same walk-back
+      // sendRescheduleSms does when a confirmed appointment moves.
+      ...(priv.confirmedAt && match.summary ? { summary: withoutCheck(match.summary) } : {}),
+      ...(priv.confirmedAt
+        ? { extendedProperties: { private: { ...priv, confirmedAt: null } } }
+        : {}),
     });
-    console.log(`event ${match.id}: confirmed by ${maskPhone(phone)}`);
+    console.log(
+      `event ${match.id}: reply recorded from ${maskPhone(phone)} — ${JSON.stringify(body)}`,
+    );
   } catch (err) {
     console.log(`callback error (acknowledged anyway): ${err.message}`);
   }
